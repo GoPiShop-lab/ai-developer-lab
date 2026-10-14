@@ -1,0 +1,153 @@
+# Codex-alapú PR-ellenőrzés – kézzel indítható, költség- és futáskorlátos.
+# Biztonság: docs/codex-review.md. A PR kódját egyik job sem futtatja; a diff csak szövegként jut el
+# a modellhez. Az OpenAI-kulcs kizárólag a "review" job egyetlen lépésében él.
+name: codex-review
+run-name: "codex-review PR #${{ inputs.pr_number }} [${{ inputs.dry_run && 'dry' || 'live' }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Az ellenőrizendő PR száma"
+        required: true
+        type: number
+      dry_run:
+        description: "Próbafutás API-hívás nélkül (alapértelmezés: igen)"
+        required: true
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: codex-review
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      allowed: ${{ steps.gate.outputs.allowed }}
+    steps:
+      - name: Csak main-ről, csak első próbálkozás
+        env:
+          REF: ${{ github.ref }}
+          ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          test "$REF" = "refs/heads/main" || { echo "::error::Csak a main ágról indítható"; exit 1; }
+          test "$ATTEMPT" = "1" || { echo "::error::Újrafuttatás tilos, indíts új futást"; exit 1; }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          persist-credentials: false
+      - name: PR, diff és futásnapló lekérése (PR-kód nem kerül futtatásra)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          case "$PR" in (*[!0-9]*|"") echo "::error::Érvénytelen PR-szám"; exit 1;; esac
+          gh api "repos/$REPO/pulls/$PR" > work/pr.json
+          gh api -H "Accept: application/vnd.github.diff" "repos/$REPO/pulls/$PR" > work/diff.txt
+          gh api --paginate "repos/$REPO/actions/workflows/codex-review.yml/runs?per_page=100&created=%3E%3D$(date -u +%Y-%m-01)" \
+            --jq '.workflow_runs[] | {id, name, created_at}' > work/runs.jsonl
+      - name: Kapu (darabszám, költség, méret)
+        id: gate
+        env:
+          PR: ${{ inputs.pr_number }}
+          DRY: ${{ inputs.dry_run }}
+          REF: ${{ github.ref }}
+          ATTEMPT: ${{ github.run_attempt }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 -m review prepare --pr-number "$PR" --pr work/pr.json --diff work/diff.txt \
+            --runs work/runs.jsonl --run-id "$RUN_ID" --run-attempt "$ATTEMPT" --ref "$REF" \
+            --dry-run "$DRY" --out out
+          python3 -c "import json;print('allowed='+str(json.load(open('out/meta.json'))['allowed']).lower())" >> "$GITHUB_OUTPUT"
+          python3 -c "import json;m=json.load(open('out/meta.json'));print(f\"Kapu: {m['allowed']} – {m['reason']}\")" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: review-input
+          path: |
+            out/meta.json
+            out/diff.txt
+          retention-days: 3
+
+  review:
+    needs: prepare
+    if: needs.prepare.outputs.allowed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Csak első próbálkozás (a hibás job újrafuttatása is tilos)
+        env:
+          ATTEMPT: ${{ github.run_attempt }}
+        run: test "$ATTEMPT" = "1" || { echo "::error::Újrafuttatás tilos"; exit 1; }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: review-input
+          path: in
+      - name: Egyetlen modellhívás (a kulcs csak ebben a lépésben, csak éles futásnál)
+        env:
+          OPENAI_API_KEY: ${{ !inputs.dry_run && secrets.OPENAI_API_KEY || '' }}
+          MODEL: ${{ vars.CODEX_REVIEW_MODEL }}
+          ATTEMPT: ${{ github.run_attempt }}
+        run: python3 -m review review --in in --out result --model "$MODEL" --run-attempt "$ATTEMPT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: review-result
+          path: result/result.json
+          retention-days: 3
+
+  publish:
+    needs: [prepare, review]
+    if: always() && needs.prepare.outputs.allowed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Csak első próbálkozás
+        env:
+          ATTEMPT: ${{ github.run_attempt }}
+        run: test "$ATTEMPT" = "1" || { echo "::error::Újrafuttatás tilos"; exit 1; }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: review-input
+          path: in
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          name: review-result
+          path: result
+      - name: Commit-SHA ellenőrzés és komment (csak komment, soha nem jóváhagyás)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          case "$PR" in (*[!0-9]*|"") exit 1;; esac
+          CURRENT_SHA="$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)"
+          python3 -m review publish --meta in/meta.json --result result/result.json \
+            --current-sha "$CURRENT_SHA" --out comment.md
+          gh api "repos/$REPO/issues/$PR/comments" -F body=@comment.md --silent

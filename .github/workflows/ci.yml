@@ -1,0 +1,26 @@
+# Tesztek minden PR-re. TITOK NÉLKÜL: ez a job a PR (megbízhatatlan) kódját futtatja.
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Egységtesztek (csak standard könyvtár, hálózat nélkül)
+        run: python3 -m unittest discover -s tests -v

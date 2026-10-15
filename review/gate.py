@@ -40,7 +40,7 @@ def decide(runs, *, my_run_id, pr_number, dry_run, ref, run_attempt, today, mont
         return False, "NOT_FROM_MAIN"
     if str(run_attempt) != "1":
         return False, "RERUN_NOT_ALLOWED"
-    worst = config.worst_case_cost_usd()
+    worst = config.guaranteed_max_cost_usd()
     if dry_run:
         return True, "DRY_RUN"
     mine = [r for r in runs if int(r["id"]) <= int(my_run_id) and _is_live(r)]

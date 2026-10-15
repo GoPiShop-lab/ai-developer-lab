@@ -86,8 +86,10 @@ jobs:
     if: needs.prepare.outputs.allowed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions:
-      contents: read
+    # Semmilyen GITHUB_TOKEN-jog. Nyilvános repóban a checkout így is működik, az azonos futáson
+    # belüli artifact-letöltés pedig nem a GITHUB_TOKEN-t használja. Bizonyíték: ci.yml
+    # "review-permissions-probe" jobja ugyanezt a mintát futtatja permissions: {} mellett.
+    permissions: {}
     steps:
       - name: Csak első próbálkozás (a hibás job újrafuttatása is tilos)
         env:

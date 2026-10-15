@@ -27,6 +27,9 @@ DRY_RUN_RESPONSE = {
             "javaslat": "Éles ellenőrzéshez dry_run=false és tulajdonosi döntés kell."}]})}]}],
 }
 
+BOUND_WARNING = ("> ⚠️ **KÖLTSÉGKORLÁT-FIGYELMEZTETÉS:** a tényleges tokenhasználat meghaladta a garantáltnak "
+                 "számolt felső korlátot. További éles futás csak a korlátszámítás felülvizsgálata után.\n\n")
+
 
 def _write(path, obj):
     pathlib.Path(path).write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -51,13 +54,14 @@ def cmd_prepare(a):
     if allowed and (pr.get("base") or {}).get("ref") != "main":
         allowed, reason = False, "BASE_NOT_MAIN"
     diff = pathlib.Path(a.diff).read_text(encoding="utf-8", errors="replace")
-    if allowed and len(diff) > config.MAX_DIFF_CHARS:
-        allowed, reason = False, f"DIFF_TOO_LARGE {len(diff)}>{config.MAX_DIFF_CHARS}"
+    diff_bytes = len(diff.encode("utf-8"))
+    if allowed and diff_bytes > config.MAX_DIFF_BYTES:
+        allowed, reason = False, f"DIFF_TOO_LARGE {diff_bytes}>{config.MAX_DIFF_BYTES}"
     meta = {"pr": pr_number, "head_sha": (pr.get("head") or {}).get("sha", ""), "dry_run": _bool(a.dry_run),
-            "allowed": allowed, "reason": reason, "diff_chars": len(diff)}
+            "allowed": allowed, "reason": reason, "diff_bytes": diff_bytes}
     _write(out / "meta.json", meta)
     (out / "diff.txt").write_text(diff if allowed else "", encoding="utf-8")
-    print(f"GATE allowed={allowed} reason={reason} diff_chars={len(diff)}")
+    print(f"GATE allowed={allowed} reason={reason} diff_bytes={diff_bytes}")
     return 0
 
 
@@ -77,6 +81,10 @@ def cmd_review(a):
             payload = prompt.build_request(diff, meta, model)
         except ValueError as e:
             raise ApiError("CONFIG_ERROR", None, str(e)) from None
+        size = prompt.request_bytes(payload)
+        result["request_bytes"] = size
+        result["max_input_tokens"] = config.max_input_tokens(size)
+        result["max_cost_usd"] = round(config.guaranteed_max_cost_usd(model, size), 6)
         if meta["dry_run"]:
             response = DRY_RUN_RESPONSE
         else:
@@ -84,6 +92,10 @@ def cmd_review(a):
         text, usage, _ = extract(response)
         result["usage"] = usage
         result["cost_usd"] = config.cost_usd(model, usage["input_tokens"], usage["output_tokens"])
+        # Utólagos ellenőrzés: ha a tényleges használat a garantáltnak hitt korlát fölött van,
+        # a feltevés megdőlt -> hangos jelzés a kommentben, további éles futás csak felülvizsgálat után.
+        result["bound_exceeded"] = (int(usage["input_tokens"] or 0) > result["max_input_tokens"]
+                                    or int(usage["output_tokens"] or 0) > config.MAX_OUTPUT_TOKENS)
         try:
             obj = json.loads(text)
         except Exception:
@@ -118,6 +130,8 @@ def cmd_publish(a):
                                     result.get("cost_usd", 0.0))
         except Exception as e:
             body = render.render_error(meta, "RENDER_ERROR", type(e).__name__)
+    if result and result.get("bound_exceeded") and current == meta["head_sha"]:
+        body = BOUND_WARNING + body
     pathlib.Path(a.out).write_text(body, encoding="utf-8")
     print("PUBLISH body_chars=%d stale=%s" % (len(body), current != meta["head_sha"]))
     return 0

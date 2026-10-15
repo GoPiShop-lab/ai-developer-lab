@@ -45,11 +45,42 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "MODEL_NOT_ALLOWED"):
             config.price("gpt-unknown")
 
-    def test_monthly_worst_case_within_hard_limit(self):
-        worst = config.worst_case_cost_usd()
-        self.assertLess(worst, 0.10)
-        self.assertLessEqual(config.MAX_LIVE_RUNS_PER_MONTH * worst, config.MONTHLY_BUDGET_USD)
+    def test_guaranteed_bound_fits_budget_and_hard_limit(self):
+        g = config.guaranteed_max_cost_usd()
+        # (36 000 bájt + 2 000 tartalék) * 2 USD/M + 4 000 * 10 USD/M = 0,116 USD
+        self.assertAlmostEqual(g, 0.116)
+        self.assertLessEqual(config.MAX_LIVE_RUNS_PER_MONTH * g, config.MONTHLY_BUDGET_USD)
+        self.assertLessEqual(config.MAX_LIVE_RUNS_PER_DAY * g, config.MONTHLY_BUDGET_USD)
         self.assertLess(config.MONTHLY_BUDGET_USD, 1.50)
+        self.assertLess(config.typical_cost_usd(), g)  # a becslés sosem helyettesíti a korlátot
+
+    def test_old_char_estimate_was_not_a_bound(self):
+        # 9 000 emoji = 9 000 karakter (a régi 60 000-es karakterkorlát átengedte volna),
+        # de 36 000 bájt -> akár 36 000 token. Az új, bájtalapú korlát elutasítja.
+        with self.assertRaisesRegex(ValueError, "REQUEST_TOO_LARGE"):
+            prompt.build_request("\U0001F600" * 9_000, META, "gpt-6.1-sol")
+
+    def test_request_bytes_cover_every_text_part(self):
+        diff = "árvíztűrő 漢字 \U0001F600 \"q\" \\ \n\t" * 50
+        payload = prompt.build_request(diff, META, "gpt-6.1-sol")
+        texts = [m["content"] for m in payload["input"]] + [json.dumps(schema.SCHEMA, ensure_ascii=False)]
+        content_bytes = sum(len(t.encode("utf-8")) for t in texts)
+        self.assertGreaterEqual(prompt.request_bytes(payload), content_bytes)
+        # a token <= bájt feltevés: bájtonként legalább egy token sem lépheti túl a korlátot
+        self.assertLessEqual(content_bytes, config.max_input_tokens(prompt.request_bytes(payload)))
+
+    def test_request_size_boundary_is_exact(self):
+        base = prompt.request_bytes(prompt.build_request("", META, "gpt-6.1-sol"))
+        room = config.MAX_REQUEST_BYTES - base
+        self.assertGreater(room, 30_000)
+        ok = prompt.build_request("x" * room, META, "gpt-6.1-sol")
+        self.assertEqual(prompt.request_bytes(ok), config.MAX_REQUEST_BYTES)
+        with self.assertRaisesRegex(ValueError, "REQUEST_TOO_LARGE"):
+            prompt.build_request("x" * (room + 1), META, "gpt-6.1-sol")
+
+    def test_output_cap_is_sent_to_api(self):
+        self.assertEqual(prompt.build_request("", META, "gpt-6.1-sol")["max_output_tokens"],
+                         config.MAX_OUTPUT_TOKENS)
 
     def test_cost_formula(self):
         self.assertAlmostEqual(config.cost_usd("gpt-6.1-sol", 1_000_000, 0), 2.00)
@@ -97,6 +128,14 @@ class GateTests(unittest.TestCase):
         m = [{"id": i, "name": gate.run_name(200 + i, False), "created_at": f"2026-10-{1 + i // 4:02d}T09:00:00Z"}
              for i in range(1, 14)]
         ok, why = self.d(m, 13, pr=213)
+        self.assertFalse(ok)
+        self.assertIn("MONTH_LIMIT", why)
+        # pontos határ: legfeljebb 2 futás/nap, így a napi korlát nem zavar
+        n = config.MAX_LIVE_RUNS_PER_MONTH
+        m = [{"id": i, "name": gate.run_name(300 + i, False), "created_at": f"2026-10-{1 + i // 2:02d}T09:00:00Z"}
+             for i in range(1, n + 2)]
+        self.assertTrue(self.d(m, n, pr=300 + n)[0])
+        ok, why = self.d(m, n + 1, pr=301 + n)
         self.assertFalse(ok)
         self.assertIn("MONTH_LIMIT", why)
 
@@ -347,9 +386,41 @@ class CliEndToEndTests(unittest.TestCase):
         self.assertEqual(json.loads((t / "res/result.json").read_text())["error"], "RERUN_NOT_ALLOWED")
 
     def test_oversized_diff_refused_before_any_call(self):
-        (self.tmp / "diff.txt").write_text("x" * (config.MAX_DIFF_CHARS + 1))
-        body, res, log, files = self.run_all(api_response({"osszefoglalo": "x", "megallapitasok": []}))
-        self.assertIn("DIFF_TOO_LARGE", json.loads((self.tmp / "in/meta.json").read_text())["reason"])
+        # ASCII és többbájtos eset: a kapu bájtot számol, nem karaktert
+        for content in ("x" * (config.MAX_DIFF_BYTES + 1), "\u0151" * (config.MAX_DIFF_BYTES // 2 + 1)):
+            (self.tmp / "diff.txt").write_text(content, encoding="utf-8")
+            self.assertLess(len(content), 40_000)
+            body, res, log, files = self.run_all(api_response({"osszefoglalo": "x", "megallapitasok": []}))
+            self.assertIn("DIFF_TOO_LARGE", json.loads((self.tmp / "in/meta.json").read_text())["reason"])
+            self.assertEqual(res["error"], "GATE_DENIED")
+
+    def test_request_too_large_after_escaping_fails_closed_without_call(self):
+        # a diff a prepare-kapun átmegy, de JSON-escape után a teljes kérés túl nagy -> nincs hívás
+        (self.tmp / "diff.txt").write_text('"' * 20_000)
+        t = self.tmp
+        with redirect_stdout(io.StringIO()):
+            cli.main(["prepare", "--pr-number", "7", "--pr", str(t / "pr.json"), "--diff", str(t / "diff.txt"),
+                      "--runs", str(t / "runs.jsonl"), "--run-id", "1", "--run-attempt", "1",
+                      "--ref", "refs/heads/main", "--dry-run", "false", "--out", str(t / "in")])
+            self.assertTrue(json.loads((t / "in/meta.json").read_text())["allowed"])
+            with mock.patch("review.cli.call") as c:
+                cli.main(["review", "--in", str(t / "in"), "--out", str(t / "res"), "--run-attempt", "1"])
+        self.assertFalse(c.called)
+        res = json.loads((t / "res/result.json").read_text())
+        self.assertEqual(res["error"], "CONFIG_ERROR")
+        self.assertIn("REQUEST_TOO_LARGE", res["detail"])
+
+    def test_result_records_guaranteed_bound_and_flags_violation(self):
+        body, res, log, files = self.run_all(api_response({"osszefoglalo": "jó", "megallapitasok": []}))
+        self.assertFalse(res["bound_exceeded"])
+        self.assertLessEqual(res["max_cost_usd"], config.guaranteed_max_cost_usd())
+        self.assertGreaterEqual(res["max_input_tokens"], res["request_bytes"])
+        self.assertNotIn("KÖLTSÉGKORLÁT", body)
+        for inp, out in ((10 ** 6, 50), (100, config.MAX_OUTPUT_TOKENS + 1)):
+            body, res, log, files = self.run_all(api_response({"osszefoglalo": "jó", "megallapitasok": []},
+                                                              inp=inp, out=out))
+            self.assertTrue(res["bound_exceeded"])
+            self.assertIn("KÖLTSÉGKORLÁT-FIGYELMEZTETÉS", body)
 
 
 class RedactTests(unittest.TestCase):
@@ -383,8 +454,11 @@ class WorkflowPolicyTests(unittest.TestCase):
         # próbafutásnál a kulcs nem is kerül a környezetbe
         self.assertIn("OPENAI_API_KEY: ${{ !inputs.dry_run && secrets.OPENAI_API_KEY || '' }}", jobs["review"])
         self.assertNotIn("secrets.", jobs["prepare"] + jobs["publish"])
-        self.assertNotRegex(jobs["review"], r"(?m)^\s+(pull-requests|issues|actions|contents): write")
+        # a review jobnak semmilyen GITHUB_TOKEN-joga nincs
+        self.assertIn("    permissions: {}\n", jobs["review"])
+        self.assertNotRegex(jobs["review"], r"(?m)^\s+[a-z-]+: (read|write)\s*$")
         self.assertNotIn("GH_TOKEN", jobs["review"])
+        self.assertNotIn("github.token", jobs["review"])
         self.assertNotIn("secrets.", self.CI)
 
     def test_every_job_guards_rerun_and_uses_pinned_actions(self):
@@ -401,6 +475,20 @@ class WorkflowPolicyTests(unittest.TestCase):
         for wf in (self.WF, self.CI):
             for block in re.findall(r"run: \|\n((?:\s{10,}.*\n)+)", wf) + re.findall(r"run: (.+)", wf):
                 self.assertNotIn("${{", block)
+
+    def test_ci_probe_mirrors_review_job_without_permissions(self):
+        ci_jobs = self.CI.split("\njobs:\n", 1)[1]
+        probe = ci_jobs.split("  review-permissions-probe:\n", 1)[1]
+        self.assertIn("    permissions: {}\n", probe)
+        review = self.jobs()["review"]
+        for marker in ("actions/checkout@", "actions/download-artifact@", "python3 -m review review --in in"):
+            self.assertIn(marker, probe, marker)
+            self.assertIn(marker, review, marker)
+        # a próbában is ugyanaz a rögzített akcióverzió
+        for action in ("checkout", "download-artifact"):
+            pin = re.search(rf"actions/{action}@([0-9a-f]{{40}})", review).group(1)
+            self.assertIn(pin, probe)
+        self.assertNotIn("secrets.", probe)
 
     def test_no_pr_code_checkout_and_no_merge_or_approve(self):
         self.assertNotIn("github.event.pull_request.head", self.WF)

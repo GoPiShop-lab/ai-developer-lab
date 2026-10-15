@@ -1,6 +1,7 @@
 """A kérés összeállítása. A diff MEGBÍZHATATLAN adat: véletlen határolók közé kerül, és a
 kérés paramétereit (modell, tokenkorlát, séma) semmilyen diff-tartalom nem befolyásolhatja."""
 
+import json
 import secrets
 
 from review import config, schema
@@ -44,10 +45,8 @@ def build_user_message(diff, meta):
 
 def build_request(diff, meta, model):
     config.price(model)  # elavult / nem engedélyezett modell -> ValueError
-    if len(diff) > config.MAX_DIFF_CHARS:
-        raise ValueError("DIFF_TOO_LARGE")
     user, _ = build_user_message(diff, meta)
-    return {
+    payload = {
         "model": model,
         "store": False,
         "max_output_tokens": config.MAX_OUTPUT_TOKENS,
@@ -65,3 +64,14 @@ def build_request(diff, meta, model):
             }
         },
     }
+    size = request_bytes(payload)
+    if size > config.MAX_REQUEST_BYTES:
+        raise ValueError(f"REQUEST_TOO_LARGE {size}>{config.MAX_REQUEST_BYTES}")
+    return payload
+
+
+def request_bytes(payload):
+    """A kérés JSON-alakjának UTF-8 bájtszáma (ensure_ascii=False). Ez sosem kisebb a kérésben
+    szereplő összes szöveg (utasítás, séma, diff) UTF-8 bájtszámánál, mert a JSON csak hozzáad
+    (kulcsok, idézőjelek, escape-ek)."""
+    return len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))

@@ -13,12 +13,13 @@ DEPRECATED_MODELS = {
     "gpt-5-codex", "gpt-5.2-codex", "codex-mini-latest",
 }
 
-# --- Bemeneti korlát: GARANTÁLT felső becslés, nem átlagos karakter/token arány ---
+# --- Bemeneti korlát: KONZERVATÍV ELMÉLETI felső becslés (nem igazolt garancia) ---
 # A teljes kérés (rendszerutasítás + JSON-séma + diff + minden JSON-mező) UTF-8 bájtszámát mérjük.
 # Bájtszintű BPE-tokenizálónál minden token legalább 1 bájtot fed le, ezért a szöveg tokenszáma
 # <= a bájtszáma. A szerveroldali keretezés (szerepjelölők, a séma belső formája) nem nyilvános:
-# erre fix tartalék szolgál. Ami e fölött maradna, azt a hívás utáni ellenőrzés jelzi, és végső
-# védelemként az OpenAI-projekt 1,50 USD kemény korlátja állítja meg.
+# erre fix tartalék szolgál. A szerveroldali tokenelszámolás felső határa NEM igazolt, ezért ez
+# becslés, nem garancia. A hívás utáni ellenőrzés csak észlel (nem előzetes korlát); a ténylegesen
+# kikényszerített költséghatár az OpenAI-projekt 1,50 USD kemény korlátja.
 MAX_REQUEST_BYTES = 36_000       # a teljes szerializált kérés; felette nincs hívás (fail-closed)
 MAX_DIFF_BYTES = 32_000          # korai kapu a prepare jobban (informatív); a döntő a fenti
 FRAMING_MARGIN_TOKENS = 2_000    # szerveroldali keretezés tartaléka
@@ -47,18 +48,18 @@ def price(model):
 
 
 def max_input_tokens(request_bytes=MAX_REQUEST_BYTES):
-    """Garantált felső korlát a bemeneti tokenekre: bájtszám + keretezési tartalék."""
+    """Elméleti felső becslés a bemeneti tokenekre: bájtszám + keretezési tartalék (nem igazolt garancia)."""
     return int(request_bytes) + FRAMING_MARGIN_TOKENS
 
 
-def guaranteed_max_cost_usd(model=DEFAULT_MODEL, request_bytes=MAX_REQUEST_BYTES):
-    """Egy futás legnagyobb lehetséges költsége (USD). Erre épül a havi keret, nem a becslésre."""
+def theoretical_max_cost_usd(model=DEFAULT_MODEL, request_bytes=MAX_REQUEST_BYTES):
+    """Egy futás konzervatív elméleti maximuma (USD). Erre épül a havi keret; nem igazolt garancia."""
     p = price(model)
     return (max_input_tokens(request_bytes) * p["input"] + MAX_OUTPUT_TOKENS * p["output"]) / 1_000_000
 
 
 def typical_cost_usd(model=DEFAULT_MODEL, request_bytes=MAX_REQUEST_BYTES):
-    """Tájékoztató becslés (átlagos kód, átlagos válasz). Költségkorlátként NEM használható."""
+    """Tájékoztató átlagbecslés (átlagos kód, átlagos válasz). Költségkorlátként NEM használható."""
     p = price(model)
     return (request_bytes / TYPICAL_BYTES_PER_TOKEN * p["input"] + TYPICAL_OUTPUT_TOKENS * p["output"]) / 1_000_000
 

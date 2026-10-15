@@ -27,12 +27,19 @@ DRY_RUN_RESPONSE = {
             "javaslat": "Éles ellenőrzéshez dry_run=false és tulajdonosi döntés kell."}]})}]}],
 }
 
-BOUND_WARNING = ("> ⚠️ **KÖLTSÉGKORLÁT-FIGYELMEZTETÉS:** a tényleges tokenhasználat meghaladta a garantáltnak "
-                 "számolt felső korlátot. További éles futás csak a korlátszámítás felülvizsgálata után.\n\n")
+BOUND_WARNING = ("> ⚠️ **KÖLTSÉGKORLÁT-FIGYELMEZTETÉS:** a tényleges tokenhasználat meghaladta az elméleti "
+                 "felső becslést. További éles futás csak a korlátszámítás felülvizsgálata után.\n\n")
 
 
 def _write(path, obj):
     pathlib.Path(path).write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_json(path):
+    try:
+        return json.loads(pathlib.Path(path).read_text(encoding="utf-8") or "{}")
+    except Exception:
+        return {}  # olvashatatlan -> fail-closed (check_environment elutasítja)
 
 
 def _bool(v):
@@ -49,6 +56,13 @@ def cmd_prepare(a):
     allowed, reason = gate.decide(runs, my_run_id=a.run_id, pr_number=pr_number, dry_run=_bool(a.dry_run),
                                   ref=a.ref, run_attempt=a.run_attempt,
                                   today=now.strftime("%Y-%m-%d"), month=now.strftime("%Y-%m"))
+    env_ok, env_reason = False, "ENV_NOT_CHECKED"   # ellenőrzés nélkül nincs éles futás
+    if a.env:
+        env = _load_json(a.env)
+        pol = _load_json(a.env_policies) if a.env_policies else {}
+        env_ok, env_reason = gate.check_environment(env, pol)
+    if allowed and not _bool(a.dry_run) and not env_ok:
+        allowed, reason = False, env_reason      # éles futás csak igazolt main-only Environmenttel
     if allowed and pr.get("state") != "open":
         allowed, reason = False, "PR_NOT_OPEN"
     if allowed and (pr.get("base") or {}).get("ref") != "main":
@@ -58,10 +72,10 @@ def cmd_prepare(a):
     if allowed and diff_bytes > config.MAX_DIFF_BYTES:
         allowed, reason = False, f"DIFF_TOO_LARGE {diff_bytes}>{config.MAX_DIFF_BYTES}"
     meta = {"pr": pr_number, "head_sha": (pr.get("head") or {}).get("sha", ""), "dry_run": _bool(a.dry_run),
-            "allowed": allowed, "reason": reason, "diff_bytes": diff_bytes}
+            "allowed": allowed, "reason": reason, "diff_bytes": diff_bytes, "environment": env_reason}
     _write(out / "meta.json", meta)
     (out / "diff.txt").write_text(diff if allowed else "", encoding="utf-8")
-    print(f"GATE allowed={allowed} reason={reason} diff_bytes={diff_bytes}")
+    print(f"GATE allowed={allowed} reason={reason} diff_bytes={diff_bytes} environment={env_reason}")
     return 0
 
 
@@ -84,7 +98,7 @@ def cmd_review(a):
         size = prompt.request_bytes(payload)
         result["request_bytes"] = size
         result["max_input_tokens"] = config.max_input_tokens(size)
-        result["max_cost_usd"] = round(config.guaranteed_max_cost_usd(model, size), 6)
+        result["theoretical_max_cost_usd"] = round(config.theoretical_max_cost_usd(model, size), 6)
         if meta["dry_run"]:
             response = DRY_RUN_RESPONSE
         else:
@@ -92,8 +106,8 @@ def cmd_review(a):
         text, usage, _ = extract(response)
         result["usage"] = usage
         result["cost_usd"] = config.cost_usd(model, usage["input_tokens"], usage["output_tokens"])
-        # Utólagos ellenőrzés: ha a tényleges használat a garantáltnak hitt korlát fölött van,
-        # a feltevés megdőlt -> hangos jelzés a kommentben, további éles futás csak felülvizsgálat után.
+        # Utólagos ÉSZLELÉS (nem előzetes korlát – a költség ekkor már felmerült): ha a tényleges
+        # használat az elméleti becslés fölött van, a feltevés megdőlt -> hangos jelzés a kommentben, további éles futás csak felülvizsgálat után.
         result["bound_exceeded"] = (int(usage["input_tokens"] or 0) > result["max_input_tokens"]
                                     or int(usage["output_tokens"] or 0) > config.MAX_OUTPUT_TOKENS)
         try:
@@ -143,6 +157,8 @@ def main(argv=None):
     s = sub.add_parser("prepare")
     for k in ("pr-number", "pr", "diff", "runs", "run-id", "run-attempt", "ref", "dry-run", "out"):
         s.add_argument("--" + k, required=True)
+    s.add_argument("--env", default="")
+    s.add_argument("--env-policies", dest="env_policies", default="")
     s = sub.add_parser("review")
     s.add_argument("--in", dest="inp", required=True)
     s.add_argument("--out", required=True)

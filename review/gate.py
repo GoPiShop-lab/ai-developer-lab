@@ -40,15 +40,19 @@ def decide(runs, *, my_run_id, pr_number, dry_run, ref, run_attempt, today, mont
         return False, "NOT_FROM_MAIN"
     if str(run_attempt) != "1":
         return False, "RERUN_NOT_ALLOWED"
-    worst = config.guaranteed_max_cost_usd()
+    worst = config.theoretical_max_cost_usd()
     if dry_run:
         return True, "DRY_RUN"
     mine = [r for r in runs if int(r["id"]) <= int(my_run_id) and _is_live(r)]
     if not any(int(r["id"]) == int(my_run_id) for r in mine):
         return False, "OWN_RUN_NOT_FOUND"
     per_pr = sum(1 for r in mine if _is_pr(r, pr_number))
-    per_day = sum(1 for r in mine if str(r.get("created_at", "")).startswith(today))
-    per_month = sum(1 for r in mine if str(r.get("created_at", "")).startswith(month))
+    # A saját futás MINDIG beszámít az aktuális napba/hónapba: hónapváltáskor a GitHub created_at
+    # még az előző hónapra eshet, de a hívás (és az OpenAI-számlázás) már az aktuálisban történik.
+    def _in(r, prefix):
+        return int(r["id"]) == int(my_run_id) or str(r.get("created_at", "")).startswith(prefix)
+    per_day = sum(1 for r in mine if _in(r, today))
+    per_month = sum(1 for r in mine if _in(r, month))
     if per_pr > config.MAX_LIVE_RUNS_PER_PR:
         return False, f"PR_LIMIT {per_pr}>{config.MAX_LIVE_RUNS_PER_PR}"
     if per_day > config.MAX_LIVE_RUNS_PER_DAY:
@@ -58,3 +62,29 @@ def decide(runs, *, my_run_id, pr_number, dry_run, ref, run_attempt, today, mont
     if per_month * worst > config.MONTHLY_BUDGET_USD:
         return False, f"BUDGET_LIMIT {per_month * worst:.2f}>{config.MONTHLY_BUDGET_USD:.2f}"
     return True, f"OK pr={per_pr} day={per_day} month={per_month} worst_month_usd={per_month * worst:.2f}"
+
+
+ENVIRONMENT_NAME = "codex-review"
+
+
+def check_environment(env, policies):
+    """A codex-review Environment ellenőrzése a GitHub API válaszaiból (nem feltételezzük).
+
+    env:      GET /repos/{repo}/environments/codex-review (hiba / hiány esetén {})
+    policies: GET .../environments/codex-review/deployment-branch-policies (hiba esetén {})
+    Elvárt: létezik, egyedi ágszabály van bekapcsolva, és pontosan egy szabály: branch "main".
+    """
+    if not isinstance(env, dict) or env.get("name") != ENVIRONMENT_NAME:
+        return False, "ENV_MISSING"
+    dbp = env.get("deployment_branch_policy")
+    if not isinstance(dbp, dict):
+        return False, "ENV_NO_BRANCH_POLICY"
+    if dbp.get("protected_branches") or not dbp.get("custom_branch_policies"):
+        return False, "ENV_POLICY_NOT_CUSTOM"
+    items = (policies or {}).get("branch_policies") if isinstance(policies, dict) else None
+    if not isinstance(items, list):
+        return False, "ENV_POLICIES_UNREADABLE"
+    rules = sorted((str(i.get("name")), str(i.get("type", "branch"))) for i in items if isinstance(i, dict))
+    if rules != [("main", "branch")]:
+        return False, "ENV_POLICY_NOT_MAIN_ONLY"
+    return True, "ENV_OK"

@@ -21,6 +21,9 @@ from review.redact import redact  # noqa: E402
 
 FAKE_KEY = "sk-proj-FAKEKEYFORTESTS1234567890abcdef"
 SHA = "a" * 40
+ENV_OK = {"name": "codex-review",
+          "deployment_branch_policy": {"protected_branches": False, "custom_branch_policies": True}}
+POLICIES_OK = {"total_count": 1, "branch_policies": [{"id": 1, "name": "main", "type": "branch"}]}
 META = {"pr": 7, "head_sha": SHA, "dry_run": False, "allowed": True, "reason": "OK", "diff_chars": 10}
 
 
@@ -45,8 +48,8 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "MODEL_NOT_ALLOWED"):
             config.price("gpt-unknown")
 
-    def test_guaranteed_bound_fits_budget_and_hard_limit(self):
-        g = config.guaranteed_max_cost_usd()
+    def test_theoretical_bound_fits_budget_and_hard_limit(self):
+        g = config.theoretical_max_cost_usd()
         # (36 000 bájt + 2 000 tartalék) * 2 USD/M + 4 000 * 10 USD/M = 0,116 USD
         self.assertAlmostEqual(g, 0.116)
         self.assertLessEqual(config.MAX_LIVE_RUNS_PER_MONTH * g, config.MONTHLY_BUDGET_USD)
@@ -144,6 +147,63 @@ class GateTests(unittest.TestCase):
         self.assertTrue(self.d(r, 10, dry=True)[0])
         live = self.runs(3) + [{"id": 4, "name": gate.run_name(7, False), "created_at": "2026-10-14T11:00:00Z"}]
         self.assertFalse(self.d(live + self.runs(5, live=False, start=10), 4)[0])
+
+    def test_month_rollover_exact_utc_boundary(self):
+        n = config.MAX_LIVE_RUNS_PER_MONTH
+
+        def run(i, ts):
+            return {"id": i, "name": gate.run_name(600 + i, False), "created_at": ts}
+
+        def dec(runs, my, ts):
+            return gate.decide(runs, my_run_id=my, pr_number=600 + my, dry_run=False, ref="refs/heads/main",
+                               run_attempt="1", today=ts[:10], month=ts[:7])
+        # szeptember: n-1 futás korábbi napokon (≤ 2/nap), az n-edik az utolsó UTC-másodpercben
+        runs = [run(i, f"2026-09-{20 + i // 2:02d}T09:00:00Z") for i in range(1, n)]
+        last = "2026-09-30T23:59:59Z"
+        runs.append(run(n, last))
+        ok, why = dec(runs, n, last)
+        self.assertTrue(ok, why)                             # limit előtt: az n-edik még mehet
+        self.assertIn(f"month={n}", why)
+        runs.append(run(n + 1, last))
+        ok, why = dec(runs, n + 1, last)
+        self.assertFalse(ok)                                 # limit után: az n+1-edik nem
+        self.assertIn("MONTH_LIMIT", why)
+        # október 1. 00:00:00 UTC: a szeptemberi (utolsó napi) futások nem számítanak
+        first = "2026-10-01T00:00:00Z"
+        oct_runs = []
+        for k in range(1, n + 2):
+            i = n + 1 + k
+            ts = first if k == 1 else f"2026-10-{1 + k // 2:02d}T08:00:00Z"
+            oct_runs.append(run(i, ts))
+            ok, why = dec(runs + oct_runs, i, ts)
+            if k <= n:
+                self.assertTrue(ok, (k, why))
+                self.assertIn(f"month={k}", why)
+            else:
+                self.assertFalse(ok)                         # október n+1-edik futása: limit
+                self.assertIn("MONTH_LIMIT", why)
+        # egy nappal korábbi hónapba eső (szept. 30.) futás nem számít az októberi napi korlátba sem
+        ok, why = dec(runs + [run(99, first)], 99, first)
+        self.assertIn("day=1", why)
+
+    def test_environment_check_is_strict(self):
+        self.assertEqual(gate.check_environment(ENV_OK, POLICIES_OK), (True, "ENV_OK"))
+        bad = [
+            ({}, POLICIES_OK, "ENV_MISSING"),
+            ({"name": "other"}, POLICIES_OK, "ENV_MISSING"),
+            ({"name": "codex-review", "deployment_branch_policy": None}, POLICIES_OK, "ENV_NO_BRANCH_POLICY"),
+            ({"name": "codex-review", "deployment_branch_policy": {"protected_branches": True,
+                                                                   "custom_branch_policies": False}},
+             POLICIES_OK, "ENV_POLICY_NOT_CUSTOM"),
+            (ENV_OK, {}, "ENV_POLICIES_UNREADABLE"),
+            (ENV_OK, {"branch_policies": []}, "ENV_POLICY_NOT_MAIN_ONLY"),
+            (ENV_OK, {"branch_policies": [{"name": "main", "type": "branch"},
+                                          {"name": "feat/*", "type": "branch"}]}, "ENV_POLICY_NOT_MAIN_ONLY"),
+            (ENV_OK, {"branch_policies": [{"name": "main", "type": "tag"}]}, "ENV_POLICY_NOT_MAIN_ONLY"),
+            (ENV_OK, {"branch_policies": [{"name": "mai*", "type": "branch"}]}, "ENV_POLICY_NOT_MAIN_ONLY"),
+        ]
+        for env, pol, why in bad:
+            self.assertEqual(gate.check_environment(env, pol), (False, why), (env, pol))
 
     def test_own_run_must_exist(self):
         self.assertEqual(self.d(self.runs(1), 99)[1], "OWN_RUN_NOT_FOUND")
@@ -303,6 +363,20 @@ class CliEndToEndTests(unittest.TestCase):
         (self.tmp / "diff.txt").write_text("+print('hello')\n")
         (self.tmp / "runs.jsonl").write_text(json.dumps({"id": 1, "name": gate.run_name(7, False),
                                                          "created_at": "2026-10-14T10:00:00Z"}) + "\n")
+        (self.tmp / "env.json").write_text(json.dumps(ENV_OK))
+        (self.tmp / "pol.json").write_text(json.dumps(POLICIES_OK))
+
+    def prepare(self, dry=False, env=True, now=(2026, 10, 14, 12), run_id="1"):
+        t = self.tmp
+        extra = ["--env", str(t / "env.json"), "--env-policies", str(t / "pol.json")] if env else []
+        import datetime as real
+        with redirect_stdout(io.StringIO()), mock.patch("review.cli.dt") as fdt:
+            fdt.datetime.now.return_value = real.datetime(*now, tzinfo=real.timezone.utc)
+            fdt.timezone = real.timezone
+            cli.main(["prepare", "--pr-number", "7", "--pr", str(t / "pr.json"), "--diff", str(t / "diff.txt"),
+                      "--runs", str(t / "runs.jsonl"), "--run-id", run_id, "--run-attempt", "1",
+                      "--ref", "refs/heads/main", "--dry-run", str(dry).lower(), "--out", str(t / "in")] + extra)
+        return json.loads((t / "in/meta.json").read_text())
 
     def run_all(self, response=None, dry=False, current_sha=SHA, http_error=None):
         t = self.tmp
@@ -315,7 +389,8 @@ class CliEndToEndTests(unittest.TestCase):
             fdt.timezone = real.timezone
             cli.main(["prepare", "--pr-number", "7", "--pr", str(t / "pr.json"), "--diff", str(t / "diff.txt"),
                       "--runs", str(t / "runs.jsonl"), "--run-id", "1", "--run-attempt", "1",
-                      "--ref", "refs/heads/main", "--dry-run", str(dry).lower(), "--out", str(t / "in")])
+                      "--ref", "refs/heads/main", "--dry-run", str(dry).lower(), "--out", str(t / "in"),
+                      "--env", str(t / "env.json"), "--env-policies", str(t / "pol.json")])
 
             def fake_call(payload, key):
                 self.assertEqual(key, FAKE_KEY)
@@ -379,7 +454,8 @@ class CliEndToEndTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             cli.main(["prepare", "--pr-number", "7", "--pr", str(t / "pr.json"), "--diff", str(t / "diff.txt"),
                       "--runs", str(t / "runs.jsonl"), "--run-id", "1", "--run-attempt", "1",
-                      "--ref", "refs/heads/main", "--dry-run", "false", "--out", str(t / "in")])
+                      "--ref", "refs/heads/main", "--dry-run", "false", "--out", str(t / "in"),
+                      "--env", str(t / "env.json"), "--env-policies", str(t / "pol.json")])
             with mock.patch("review.cli.call") as c:
                 cli.main(["review", "--in", str(t / "in"), "--out", str(t / "res"), "--run-attempt", "2"])
         self.assertFalse(c.called)
@@ -401,7 +477,8 @@ class CliEndToEndTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             cli.main(["prepare", "--pr-number", "7", "--pr", str(t / "pr.json"), "--diff", str(t / "diff.txt"),
                       "--runs", str(t / "runs.jsonl"), "--run-id", "1", "--run-attempt", "1",
-                      "--ref", "refs/heads/main", "--dry-run", "false", "--out", str(t / "in")])
+                      "--ref", "refs/heads/main", "--dry-run", "false", "--out", str(t / "in"),
+                      "--env", str(t / "env.json"), "--env-policies", str(t / "pol.json")])
             self.assertTrue(json.loads((t / "in/meta.json").read_text())["allowed"])
             with mock.patch("review.cli.call") as c:
                 cli.main(["review", "--in", str(t / "in"), "--out", str(t / "res"), "--run-attempt", "1"])
@@ -410,10 +487,10 @@ class CliEndToEndTests(unittest.TestCase):
         self.assertEqual(res["error"], "CONFIG_ERROR")
         self.assertIn("REQUEST_TOO_LARGE", res["detail"])
 
-    def test_result_records_guaranteed_bound_and_flags_violation(self):
+    def test_result_records_theoretical_bound_and_flags_violation(self):
         body, res, log, files = self.run_all(api_response({"osszefoglalo": "jó", "megallapitasok": []}))
         self.assertFalse(res["bound_exceeded"])
-        self.assertLessEqual(res["max_cost_usd"], config.guaranteed_max_cost_usd())
+        self.assertLessEqual(res["theoretical_max_cost_usd"], config.theoretical_max_cost_usd())
         self.assertGreaterEqual(res["max_input_tokens"], res["request_bytes"])
         self.assertNotIn("KÖLTSÉGKORLÁT", body)
         for inp, out in ((10 ** 6, 50), (100, config.MAX_OUTPUT_TOKENS + 1)):
@@ -421,6 +498,38 @@ class CliEndToEndTests(unittest.TestCase):
                                                               inp=inp, out=out))
             self.assertTrue(res["bound_exceeded"])
             self.assertIn("KÖLTSÉGKORLÁT-FIGYELMEZTETÉS", body)
+
+
+    def test_live_run_requires_verified_environment(self):
+        self.assertTrue(self.prepare()["allowed"])
+        meta = self.prepare(env=False)                       # nincs ellenőrzés -> nincs éles futás
+        self.assertEqual((meta["allowed"], meta["reason"]), (False, "ENV_NOT_CHECKED"))
+        (self.tmp / "env.json").write_text("{}")             # 404 / API-hiba -> {}
+        self.assertEqual(self.prepare()["reason"], "ENV_MISSING")
+        (self.tmp / "env.json").write_text("not json")
+        self.assertEqual(self.prepare()["reason"], "ENV_MISSING")
+        (self.tmp / "env.json").write_text(json.dumps(ENV_OK))
+        (self.tmp / "pol.json").write_text(json.dumps({"branch_policies": [{"name": "*", "type": "branch"}]}))
+        self.assertEqual(self.prepare()["reason"], "ENV_POLICY_NOT_MAIN_ONLY")
+
+    def test_dry_run_allowed_without_environment_but_reports_it(self):
+        (self.tmp / "env.json").write_text("{}")
+        meta = self.prepare(dry=True)
+        self.assertTrue(meta["allowed"])
+        self.assertEqual(meta["environment"], "ENV_MISSING")
+
+    def test_cli_month_rollover_uses_utc_and_counts_own_run(self):
+        # előző hónapban a keret betelt; az új hónap első UTC-másodperceiben indított futás mehet
+        n = config.MAX_LIVE_RUNS_PER_MONTH
+        sept = [{"id": i, "name": gate.run_name(500 + i, False), "created_at": f"2026-09-{20 + i // 2:02d}T09:00:00Z"}
+                for i in range(1, n + 1)]
+        own = {"id": n + 1, "name": gate.run_name(7, False), "created_at": "2026-09-30T23:59:59Z"}
+        (self.tmp / "runs.jsonl").write_text("".join(json.dumps(r) + "\n" for r in sept + [own]))
+        meta = self.prepare(now=(2026, 10, 1, 0, 0, 5), run_id=str(n + 1))
+        self.assertTrue(meta["allowed"], meta["reason"])
+        self.assertIn("month=1", meta["reason"])            # a saját futás az új hónapba számít
+        meta = self.prepare(now=(2026, 9, 30, 23, 59, 59), run_id=str(n + 1))
+        self.assertIn("MONTH_LIMIT", meta["reason"])         # ugyanez szeptemberben értékelve: limit
 
 
 class RedactTests(unittest.TestCase):
@@ -454,6 +563,11 @@ class WorkflowPolicyTests(unittest.TestCase):
         # próbafutásnál a kulcs nem is kerül a környezetbe
         self.assertIn("OPENAI_API_KEY: ${{ !inputs.dry_run && secrets.OPENAI_API_KEY || '' }}", jobs["review"])
         self.assertNotIn("secrets.", jobs["prepare"] + jobs["publish"])
+        # a kulcs Environment-secret; az Environment-beállítást a prepare API-n ellenőrzi
+        self.assertIn("    environment: codex-review\n", jobs["review"])
+        self.assertNotIn("environment:", jobs["prepare"] + jobs["publish"])
+        self.assertIn("repos/$REPO/environments/codex-review/deployment-branch-policies", jobs["prepare"])
+        self.assertIn("--env work/env.json --env-policies work/env_policies.json", jobs["prepare"])
         # a review jobnak semmilyen GITHUB_TOKEN-joga nincs
         self.assertIn("    permissions: {}\n", jobs["review"])
         self.assertNotRegex(jobs["review"], r"(?m)^\s+[a-z-]+: (read|write)\s*$")
@@ -493,8 +607,10 @@ class WorkflowPolicyTests(unittest.TestCase):
     def test_no_pr_code_checkout_and_no_merge_or_approve(self):
         self.assertNotIn("github.event.pull_request.head", self.WF)
         self.assertNotRegex(self.WF, r"ref: (?!main)")
-        for word in ("/merge", "APPROVE", "pulls/$PR/reviews", "gh pr merge", "deploy"):
+        for word in ("/merge", "APPROVE", "pulls/$PR/reviews", "gh pr merge", "/deployments"):
             self.assertNotIn(word, self.WF)
+        # "deploy" csak az Environment-ágszabály olvasásában fordulhat elő (deployment-branch-policies)
+        self.assertNotRegex(self.WF.replace("deployment-branch-policies", ""), r"(?i)deploy")
 
 
 if __name__ == "__main__":

@@ -56,6 +56,10 @@ jobs:
           case "$PR" in (*[!0-9]*|"") echo "::error::Érvénytelen PR-szám"; exit 1;; esac
           gh api "repos/$REPO/pulls/$PR" > work/pr.json
           gh api -H "Accept: application/vnd.github.diff" "repos/$REPO/pulls/$PR" > work/diff.txt
+          # Environment-beállítás lekérése (nem feltételezzük); hiba/hiány -> {} -> éles futás tiltva
+          gh api "repos/$REPO/environments/codex-review" > work/env.json 2>/dev/null || echo '{}' > work/env.json
+          gh api "repos/$REPO/environments/codex-review/deployment-branch-policies" > work/env_policies.json 2>/dev/null \
+            || echo '{}' > work/env_policies.json
           gh api --paginate "repos/$REPO/actions/workflows/codex-review.yml/runs?per_page=100&created=%3E%3D$(date -u +%Y-%m-01)" \
             --jq '.workflow_runs[] | {id, name, created_at}' > work/runs.jsonl
       - name: Kapu (darabszám, költség, méret)
@@ -70,9 +74,9 @@ jobs:
           set -euo pipefail
           python3 -m review prepare --pr-number "$PR" --pr work/pr.json --diff work/diff.txt \
             --runs work/runs.jsonl --run-id "$RUN_ID" --run-attempt "$ATTEMPT" --ref "$REF" \
-            --dry-run "$DRY" --out out
+            --dry-run "$DRY" --env work/env.json --env-policies work/env_policies.json --out out
           python3 -c "import json;print('allowed='+str(json.load(open('out/meta.json'))['allowed']).lower())" >> "$GITHUB_OUTPUT"
-          python3 -c "import json;m=json.load(open('out/meta.json'));print(f\"Kapu: {m['allowed']} – {m['reason']}\")" >> "$GITHUB_STEP_SUMMARY"
+          python3 -c "import json;m=json.load(open('out/meta.json'));print(f\"Kapu: {m['allowed']} – {m['reason']} – Environment: {m['environment']}\")" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: review-input
@@ -86,6 +90,9 @@ jobs:
     if: needs.prepare.outputs.allowed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # A kulcs a "codex-review" Environment secretje; az Environment csak a main ágról engedi
+    # (tulajdonosi beállítás, a prepare job éles futás előtt API-n ellenőrzi).
+    environment: codex-review
     # Semmilyen GITHUB_TOKEN-jog. Nyilvános repóban a checkout így is működik, az azonos futáson
     # belüli artifact-letöltés pedig nem a GITHUB_TOKEN-t használja. Bizonyíték: ci.yml
     # "review-permissions-probe" jobja ugyanezt a mintát futtatja permissions: {} mellett.

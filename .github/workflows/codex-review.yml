@@ -8,9 +8,11 @@ on:
   workflow_dispatch:
     inputs:
       pr_number:
-        description: "Az ellenőrizendő PR száma"
+        # string, nem number: a number típus "2" helyett "2.0"-t adott át (run 38694866799).
+        # A szó szerinti értéket a prepare és a publish szigorúan ellenőrzi (csak számjegy).
+        description: "Az ellenőrizendő PR száma (csak számjegyek, pl. 3)"
         required: true
-        type: number
+        type: string
       dry_run:
         description: "Próbafutás API-hívás nélkül (alapértelmezés: igen)"
         required: true

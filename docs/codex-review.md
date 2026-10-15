@@ -4,7 +4,7 @@ Folyamat: **Claude Code fejleszt → Codex-szerepű modell ellenőriz (csak komm
 Állapot: DRAFT, élesítés és az első fizetős hívás csak külön tulajdonosi jóváhagyással.
 
 ## 1. Működés
-`.github/workflows/codex-review.yml`, kézi indítás (`workflow_dispatch`): `pr_number`, `dry_run` (alapértelmezés: **igen**).
+`.github/workflows/codex-review.yml`, kézi indítás (`workflow_dispatch`): `pr_number` (szöveg, csak számjegy – a `number` típus „2” helyett „2.0”-t adott át, run 38694866799), `dry_run` (alapértelmezés: **igen**).
 
 | Job | Titok | GitHub-jog | Feladat |
 |---|---|---|---|
@@ -92,7 +92,7 @@ API-hiba (HTTP, hálózat, kvóta / `project_spend_limit_exceeded`), hiányos v�
 ## 7. Teszterv
 | # | Teszt | Költség |
 |---|---|---|
-| T1 | `python3 -m unittest discover -s tests -v` – 46 teszt: kapuk, hónapváltás (UTC), Environment-ellenőrzés, bájtalapú méretkorlát (határérték-tesztekkel), injekció, séma, kimenet-semlegesítés, API-hibák, hibás JSON, SHA, titokmentesség (hamis kulccsal), workflow-szabályok | 0 |
+| T1 | `python3 -m unittest discover -s tests -v` – 49 teszt: workflow_dispatch PR-szám bemenet (regresszió), kapuk, hónapváltás (UTC), Environment-ellenőrzés, bájtalapú méretkorlát (határérték-tesztekkel), injekció, séma, kimenet-semlegesítés, API-hibák, hibás JSON, SHA, titokmentesség (hamis kulccsal), workflow-szabályok | 0 |
 | T2 | `actionlint` (shellcheck-kel) a workflow-kra | 0 |
 | T3 | `ci.yml` minden PR-re, titok nélkül; benne a `review-permissions-probe` (a review-job mintája `permissions: {}` mellett) | 0 |
 | T4 | Próbafutás egy teszt-PR-en: `dry_run=true` – a teljes lánc fut, API-hívás és kulcs nélkül | 0 |

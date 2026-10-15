@@ -539,6 +539,68 @@ class RedactTests(unittest.TestCase):
         self.assertEqual(out.count("[REDACTED]"), 4)
 
 
+class DispatchInputTests(unittest.TestCase):
+    """Regresszió: run 38694866799 és 38694883548 (2026-10-15). A felületen beírt "2" egy
+    `type: number` bemenetből "2.0"-ként érkezett (a futás neve: "codex-review PR #2.0 [dry]"),
+    ezért a prepare shell-ellenőrzése "Érvénytelen PR-szám" hibával leállt."""
+
+    WF = (ROOT / ".github/workflows/codex-review.yml").read_text()
+
+    def input_type(self):
+        block = self.WF.split("      pr_number:\n", 1)[1].split("      dry_run:", 1)[0]
+        return re.search(r"type: (\w+)", block).group(1)
+
+    def rendered(self, typed):
+        """Amit a GitHub a ${{ inputs.pr_number }} helyére ír – a megfigyelt viselkedés alapján."""
+        if self.input_type() == "number":
+            return f"{float(typed)}" if re.fullmatch(r"[0-9]+", typed) else typed  # "2" -> "2.0" (bizonyított)
+        return typed                                                            # string: szó szerint
+
+    def shell_checks(self):
+        lines = [ln.strip() for ln in self.WF.splitlines() if ln.strip().startswith('case "$PR" in')]
+        self.assertEqual(len(lines), 2)  # prepare + publish
+        return lines
+
+    def run_shell(self, value):
+        import subprocess
+        results = []
+        for line in self.shell_checks():
+            r = subprocess.run(["bash", "-c", "set -euo pipefail\n" + line + "\necho PASS"],
+                               env={"PR": value, "PATH": os.environ.get("PATH", "")},
+                               capture_output=True, text=True)
+            results.append(r.returncode == 0 and "PASS" in r.stdout)
+        return results
+
+    def accepted_end_to_end(self, typed):
+        value = self.rendered(typed)
+        if not all(self.run_shell(value)):
+            return False
+        try:
+            gate.validate_pr_number(value)
+        except ValueError:
+            return False
+        return True
+
+    def test_dispatch_value_2_is_accepted(self):
+        self.assertEqual(self.rendered("2"), "2")
+        self.assertTrue(self.accepted_end_to_end("2"))
+        for typed in ("1", "9", "10", "1234567"):
+            self.assertTrue(self.accepted_end_to_end(typed), typed)
+
+    def test_invalid_values_rejected(self):
+        for typed in ("", " 2", "2 ", "2.0", "2.5", "02", "0", "-1", "+2", "1e3", "2;id", "$(id)",
+                      "2\n3", "12345678", "２"):
+            self.assertFalse(self.accepted_end_to_end(typed), repr(typed))
+
+    def test_run_name_matches_gate_run_name(self):
+        # a per-PR számláló a futás nevét veti össze gate.run_name()-mel: egyezniük kell
+        tmpl = re.search(r'^run-name: "(.*)"$', self.WF, re.M).group(1)
+        for dry in (True, False):
+            name = tmpl.replace("${{ inputs.pr_number }}", self.rendered("2")).replace(
+                "${{ inputs.dry_run && 'dry' || 'live' }}", "dry" if dry else "live")
+            self.assertEqual(name, gate.run_name(2, dry))
+
+
 class WorkflowPolicyTests(unittest.TestCase):
     WF = (ROOT / ".github/workflows/codex-review.yml").read_text()
     CI = (ROOT / ".github/workflows/ci.yml").read_text()

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+work/
+out/
+in/
+result/
+comment.md

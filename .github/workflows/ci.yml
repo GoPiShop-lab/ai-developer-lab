@@ -1,0 +1,72 @@
+# Tesztek minden PR-re. TITOK NÉLKÜL: ez a job a PR (megbízhatatlan) kódját futtatja.
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Egységtesztek (csak standard könyvtár, hálózat nélkül)
+        run: python3 -m unittest discover -s tests -v
+
+  # A codex-review "review" jobjának mintája (checkout + artifact-letöltés + review-lépés)
+  # GITHUB_TOKEN-jog NÉLKÜL. Ha ez a job zöld, a review job permissions: {} beállítása működik.
+  # API-hívás nincs: próbafutás (dry_run), kulcs nincs a környezetben.
+  review-permissions-probe-input:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Próba-bemenet (meta.json, diff.txt) előállítása
+        run: |
+          set -euo pipefail
+          mkdir -p probe
+          printf '+print("probe")\n' > probe/diff.txt
+          python3 -c "import json;json.dump({'pr':1,'head_sha':'0'*40,'dry_run':True,'allowed':True,'reason':'PROBE','diff_bytes':17},open('probe/meta.json','w'))"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: probe-input
+          path: |
+            probe/meta.json
+            probe/diff.txt
+          retention-days: 1
+
+  review-permissions-probe:
+    needs: review-permissions-probe-input
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: probe-input
+          path: in
+      - name: Review-lépés jog nélkül, kulcs nélkül (dry run)
+        env:
+          OPENAI_API_KEY: ""
+        run: |
+          set -euo pipefail
+          python3 -m review review --in in --out result --model "" --run-attempt 1
+          python3 -c "import json,sys;r=json.load(open('result/result.json'));sys.exit(0 if r['status']=='ok' and r['dry_run'] else 1)"

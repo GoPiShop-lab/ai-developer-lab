@@ -1,0 +1,1 @@
+"""Rendeléskezelés: katalógus, készlet, pénztár."""

@@ -1,0 +1,1 @@
+"""Egyszerű webshop-segédfüggvények."""
